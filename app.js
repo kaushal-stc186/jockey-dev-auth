@@ -7,19 +7,16 @@ const express = require('express');
 const openidConfiguration = require('./openid-configuration.json');
 
 const PORT = Number(process.env.PORT || 3000);
-const ISSUER = String(
-  process.env.ISSUER || 'https://jockey-auth.onrender.com',
-).replace(/\/$/, '');
+const ISSUER = String(process.env.ISSUER || '').replace(/\/$/, '');
+if (!ISSUER) {
+  throw new Error('ISSUER is required');
+}
 const CLIENT_ID = process.env.CLIENT_ID || 'jockey-mobile-auth';
 const CLIENT_SECRET = process.env.CLIENT_SECRET || '';
-const SHOPIFY_CUSTOMER_ACCOUNT_CLIENT_ID =
-  process.env.SHOPIFY_CUSTOMER_ACCOUNT_CLIENT_ID || '';
 const SHOPIFY_SHOP = String(process.env.SHOPIFY_SHOP || '')
   .replace(/^https?:\/\//, '')
   .replace(/\/$/, '');
 const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || '';
-const SHOPIFY_API_KEY = process.env.SHOPIFY_API_KEY || '';
-const SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET || '';
 const STATIC_OTP = String(process.env.STATIC_OTP || '');
 const STOREFRONT_LOGIN_URL = String(process.env.STOREFRONT_LOGIN_URL || '').replace(/\/$/, '');
 const STOREFRONT_ORIGIN = (
@@ -75,7 +72,11 @@ app.get('/.well-known/jwks.json', (_req, res) => {
 
 app.get('/authorize', (req, res) => {
   const error = validateAuthorize(req.query);
-  if (error) return res.status(400).send(page('Sign in', `<p class="error">${esc(error)}</p>`));
+  if (error) return res.status(400).json({ error });
+
+  if (!STOREFRONT_LOGIN_URL) {
+    return res.status(500).json({ error: 'STOREFRONT_LOGIN_URL is required' });
+  }
 
   const sid = newSession({
     clientId: req.query.client_id,
@@ -87,16 +88,10 @@ app.get('/authorize', (req, res) => {
     codeChallengeMethod: req.query.code_challenge_method,
   });
 
-  setSid(res, sid);
-
-  if (STOREFRONT_LOGIN_URL) {
-    const ticket = mintLoginTicket(sid);
-    const target = new URL(STOREFRONT_LOGIN_URL);
-    target.searchParams.set('ticket', ticket);
-    return res.redirect(302, target.toString());
-  }
-
-  res.send(phonePage());
+  const ticket = mintLoginTicket(sid);
+  const target = new URL(STOREFRONT_LOGIN_URL);
+  target.searchParams.set('ticket', ticket);
+  res.redirect(302, target.toString());
 });
 
 app.post('/api/login/phone', (req, res) => {
@@ -217,82 +212,6 @@ app.post('/api/login/profile', async (req, res) => {
   res.json({ redirectTo: finishLogin(session, user) });
 });
 
-app.post('/authorize/phone', (req, res) => {
-  const session = getLoginSession(req, res);
-  if (!session) return;
-  const phone = normalizePhone(req.body.phone);
-  if (!phone) {
-    return res.status(400).send(phonePage('Enter a valid 10-digit Indian mobile number'));
-  }
-
-  issueOtp(session, phone);
-  res.send(otpPage(phone));
-});
-
-app.post('/authorize/verify', async (req, res) => {
-  const session = getLoginSession(req, res);
-  if (!session) return;
-  if (!session.phone || !session.otp) return res.redirect('/authorize');
-  if (Date.now() > session.otpExp) {
-    return res.status(400).send(otpPage(session.phone, 'OTP expired. Go back and request a new one.'));
-  }
-
-  session.attempts += 1;
-  if (session.attempts > 5) {
-    return res.status(429).send(otpPage(session.phone, 'Too many attempts. Request a new OTP.'));
-  }
-  if (String(req.body.otp || '') !== session.otp) {
-    return res.status(401).send(otpPage(session.phone, 'Incorrect OTP'));
-  }
-
-  session.verified = true;
-  const shopifyCustomer = await lookupShopifyCustomer(session.phone);
-  const profile = mergedProfile(users[session.phone], shopifyCustomer);
-  session.profile = profile;
-  session.shopifyCustomerId = shopifyCustomer?.id || '';
-  if (hasProfile(profile)) {
-    const user = saveUser(session.phone, profile);
-    await syncShopifyCustomer(session.shopifyCustomerId, user);
-    return completeLogin(res, session, user);
-  }
-  res.send(profilePage(session.phone, '', profile));
-});
-
-app.post('/authorize/email', async (req, res) => {
-  const session = getLoginSession(req, res);
-  if (!session) return;
-  if (!session.verified || !session.phone) {
-    return res.status(400).send(phonePage('Verify your mobile number first'));
-  }
-
-  const known = session.profile || {};
-  const askNames = !known.firstName || !known.lastName;
-  const askEmail = !known.email;
-  const firstName = askNames ? normalizeName(req.body.first_name) : known.firstName;
-  const lastName = askNames ? normalizeName(req.body.last_name) : known.lastName;
-  const email = askEmail ? String(req.body.email || '').trim().toLowerCase() : known.email;
-  const draft = { firstName, lastName, email, askNames, askEmail };
-  if (askNames && (!firstName || !lastName)) {
-    return res.status(400).send(profilePage(session.phone, 'Enter your first and last name', draft));
-  }
-  if (askEmail && !EMAIL_RE.test(email)) {
-    return res.status(400).send(profilePage(session.phone, 'Enter a valid email', draft));
-  }
-
-  if (askEmail) {
-    const taken = Object.entries(users).find(
-      ([phone, user]) => user.email === email && phone !== session.phone,
-    );
-    if (taken) {
-      return res.status(409).send(profilePage(session.phone, 'This email is already linked to another number', draft));
-    }
-  }
-
-  const user = saveUser(session.phone, draft);
-  await syncShopifyCustomer(session.shopifyCustomerId, user);
-  completeLogin(res, session, user);
-});
-
 app.post('/token', (req, res) => {
   const body = req.body || {};
   const client = clientCredentials(req);
@@ -358,10 +277,6 @@ app.get('/logout', (req, res) => {
 app.listen(PORT, () => {
   console.log(`jockey-auth listening on ${ISSUER}`);
 });
-
-function completeLogin(res, session, user) {
-  res.redirect(302, finishLogin(session, user));
-}
 
 function finishLogin(session, user) {
   const code = randomToken();
@@ -545,235 +460,10 @@ function discovery() {
   );
 }
 
-function getLoginSession(req, res) {
-  const sid = readCookies(req).jockey_auth;
-  const session = sid ? loginSessions.get(sid) : null;
-  if (!session) {
-    res.status(400).send(page('Sign in', '<p class="error">Session expired. Start again from the store.</p>'));
-    return null;
-  }
-  session.sid = sid;
-  return session;
-}
-
 function newSession(oauth) {
   const sid = randomToken();
   loginSessions.set(sid, { ...oauth, createdAt: Date.now() });
   return sid;
-}
-
-function setSid(res, sid) {
-  const secure = ISSUER.startsWith('https') ? '; Secure' : '';
-  res.setHeader(
-    'Set-Cookie',
-    `jockey_auth=${sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(LOGIN_SESSION_TTL_MS / 1000)}${secure}`,
-  );
-}
-
-function phonePage(error) {
-  return page(
-    'Sign in',
-    `${error ? `<p class="error">${esc(error)}</p>` : ''}
-     <form id="phone-form" method="post" action="/authorize/phone">
-       <label for="phone">Mobile number</label>
-       <div class="phone">
-         <span>IN (+91)</span>
-         <input id="phone" name="phone" type="tel" inputmode="numeric" autocomplete="tel" placeholder="Enter Phone No." required>
-       </div>
-       <button type="submit">Send OTP</button>
-     </form>
-     <script>
-       const form = document.getElementById('phone-form');
-       const input = document.getElementById('phone');
-       const indianMobile = /^[6-9]\\d{9}$/;
-       let previous = '';
-       let lastAutoSent = '';
-
-       function normalizeIndianMobile(text) {
-         let digits = String(text || '').replace(/[^0-9]/g, '');
-         if (digits.length === 12 && digits.startsWith('91')) digits = digits.slice(2);
-         else if (digits.length === 11 && digits.startsWith('0')) digits = digits.slice(1);
-         else if (digits.length > 10) digits = digits.slice(-10);
-         return digits;
-       }
-
-       input.addEventListener('input', () => {
-         const raw = input.value;
-         const previousLength = previous.length;
-         const inputDigits = raw.replace(/[^0-9]/g, '');
-         const appendingPastLimit = previousLength === 10 && inputDigits.length > 10 && inputDigits.startsWith(previous);
-         const updated = appendingPastLimit ? previous : normalizeIndianMobile(raw);
-         input.value = updated;
-         previous = updated;
-         if (!indianMobile.test(updated)) {
-           lastAutoSent = '';
-           return;
-         }
-         const arrivedInOneShot = updated.length - previousLength > 1 || /[^\\d]/.test(raw);
-         if (arrivedInOneShot && lastAutoSent !== updated) {
-           lastAutoSent = updated;
-           form.requestSubmit();
-         }
-       });
-
-       form.addEventListener('submit', (event) => {
-         if (!indianMobile.test(input.value)) {
-           event.preventDefault();
-         }
-       });
-     </script>`,
-  );
-}
-
-function otpPage(phone, error) {
-  const national = nationalNumber(phone);
-  return page(
-    'Verify OTP',
-    `<p>OTP sent to +91 ${esc(national)}</p>
-     ${error ? `<p class="error">${esc(error)}</p>` : ''}
-     <form id="otp-form" method="post" action="/authorize/verify">
-       <label for="otp">4-digit OTP</label>
-       <input id="otp" name="otp" inputmode="numeric" autocomplete="one-time-code" maxlength="4" required>
-       <button type="submit">Verify</button>
-     </form>
-     <form method="post" action="/authorize/phone">
-       <input type="hidden" name="phone" value="${esc(national)}">
-       <button type="submit" class="link">Resend OTP</button>
-     </form>
-     <script>
-       const otp = document.getElementById('otp');
-       otp.addEventListener('input', () => {
-         otp.value = otp.value.replace(/\\D/g, '').slice(0, 4);
-         if (/^\\d{4}$/.test(otp.value)) otp.form.requestSubmit();
-       });
-     </script>`,
-  );
-}
-
-function profilePage(phone, error, values) {
-  const profile = values || {};
-  const askNames = profile.askNames !== undefined ? profile.askNames : !profile.firstName || !profile.lastName;
-  const askEmail = profile.askEmail !== undefined ? profile.askEmail : !profile.email;
-  const title = askNames && askEmail ? 'Your details' : askNames ? 'Your name' : 'Your email';
-  const intro = askNames && askEmail
-    ? 'Add your name and email'
-    : askNames
-      ? 'Add your first and last name'
-      : 'Add your email';
-  return page(
-    title,
-    `<p>${intro} for +91 ${esc(nationalNumber(phone))}.</p>
-     ${error ? `<p class="error">${esc(error)}</p>` : ''}
-     <form method="post" action="/authorize/email">
-       ${askNames ? `<label for="first_name">First name</label>
-       <input id="first_name" name="first_name" autocomplete="given-name" autocapitalize="words" value="${esc(profile.firstName)}" required>
-       <label for="last_name">Last name</label>
-       <input id="last_name" name="last_name" autocomplete="family-name" autocapitalize="words" value="${esc(profile.lastName)}" required>` : ''}
-       ${askEmail ? `<label for="email">Email</label>
-       <input id="email" name="email" type="email" autocomplete="email" value="${esc(profile.email)}" required>` : ''}
-       <button type="submit">Continue</button>
-     </form>`,
-  );
-}
-
-function page(title, body) {
-  return `<!doctype html>
-<html lang="en">
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${esc(title)}</title>
-<style>
-  :root { color-scheme: light; }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    min-height: 100dvh;
-    display: grid;
-    place-items: center;
-    padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
-    background: #f6f6f6;
-    color: #221f20;
-    font-family: ui-sans-serif, system-ui, sans-serif;
-  }
-  main {
-    width: min(420px, 100%);
-    display: grid;
-    align-content: start;
-    gap: 16px;
-    padding: 28px 20px;
-    background: #fff;
-    border: 1px solid #ececec;
-    border-radius: 16px;
-  }
-  h1 { margin: 0; font-size: 1.375rem; line-height: 1.3; }
-  p { margin: 0; color: #5c5859; line-height: 1.45; }
-  form { display: grid; align-content: start; gap: 8px; }
-  label { font-size: 0.875rem; font-weight: 600; }
-  input {
-    width: 100%;
-    min-height: 48px;
-    padding: 12px 14px;
-    border: 1px solid #d9d9d9;
-    border-radius: 10px;
-    background: #fff;
-    color: #221f20;
-    font-size: 16px;
-  }
-  input:focus { outline: 2px solid #221f20; outline-offset: 1px; }
-  .phone {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    min-height: 48px;
-    padding: 0 14px;
-    border: 1px solid #d9d9d9;
-    border-radius: 10px;
-    background: #fff;
-  }
-  .phone:focus-within { outline: 2px solid #221f20; outline-offset: 1px; }
-  .phone span { font-weight: 600; white-space: nowrap; }
-  .phone input { flex: 1; min-width: 0; min-height: 46px; padding: 12px 0; border: 0; }
-  .phone input:focus { outline: none; }
-  input[name="otp"] {
-    font-size: 1.5rem;
-    font-weight: 600;
-    letter-spacing: 0.4em;
-    text-align: center;
-  }
-  button {
-    min-height: 48px;
-    margin-top: 8px;
-    padding: 12px 16px;
-    border: 0;
-    border-radius: 10px;
-    background: #221f20;
-    color: #fff;
-    font-size: 16px;
-    font-weight: 600;
-  }
-  button.link {
-    margin-top: 0;
-    background: transparent;
-    color: #221f20;
-    font-weight: 500;
-    text-decoration: underline;
-  }
-  .error { color: #c62828; }
-  @media (max-width: 480px) {
-    body { place-items: stretch; align-items: start; }
-    main {
-      width: 100%;
-      min-height: calc(100dvh - 32px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
-      border: 0;
-      border-radius: 0;
-    }
-  }
-</style>
-<main>
-  <h1>${esc(title)}</h1>
-  ${body}
-</main>
-</html>`;
 }
 
 function signJwt(payload) {
@@ -824,10 +514,6 @@ function normalizePhone(input) {
   const digits = normalizeIndianMobile(input);
   if (!INDIAN_MOBILE_RE.test(digits)) return null;
   return `+91${digits}`;
-}
-
-function nationalNumber(phone) {
-  return normalizeIndianMobile(phone);
 }
 
 function normalizeName(value) {
@@ -949,24 +635,6 @@ function s256(verifier) {
   return crypto.createHash('sha256').update(String(verifier || '')).digest('base64url');
 }
 
-function readCookies(req) {
-  const out = {};
-  for (const part of String(req.headers.cookie || '').split(';')) {
-    const eq = part.indexOf('=');
-    if (eq === -1) continue;
-    out[part.slice(0, eq).trim()] = decodeURIComponent(part.slice(eq + 1).trim());
-  }
-  return out;
-}
-
 function randomToken() {
   return crypto.randomBytes(32).toString('base64url');
-}
-
-function esc(value) {
-  return String(value || '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
 }
